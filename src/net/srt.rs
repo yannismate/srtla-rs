@@ -11,16 +11,11 @@ define_layout!(srt_data, BigEndian, {
   rest: [u8],
 });
 
-define_layout!(srt_ack, BigEndian, {
-  ignored: [u8; 20],
-  rtt: u32,
-  ignored_2: [u8; 12],
-  estimated_link_capacity: u32,
-  receiving_rate: u32,
-});
-
 const SRT_TYPE_HANDSHAKE: u16 = 0x8000;
 const SRT_TYPE_ACK: u16 = 0x8002;
+const SRT_TYPE_NAK: u16 = 0x8003;
+
+const SRT_EXTENSION_TYPE_SID: u16 = 5;
 
 pub struct SrtConnection {
   pub remote_addr: SocketAddr
@@ -52,25 +47,91 @@ impl SrtConnection {
 }
 
 pub fn is_srt_ack(data: &[u8]) -> bool {
-  if data.len() < 2 {
+  if data.len() <= 2 {
     return false
   }
   u16::from_be_bytes([data[0], data[1]]) == SRT_TYPE_ACK
 }
 
-pub struct SrtAckData {
-  pub receiving_rate: u32,
-  pub rtt: u32,
-  pub estimated_link_capacity: u32
+pub fn is_srt_nak(data: &[u8]) -> bool {
+  if data.len() <= 2 {
+    return false
+  }
+  u16::from_be_bytes([data[0], data[1]]) == SRT_TYPE_NAK
 }
 
-pub fn get_srt_ack_data(data: &[u8]) -> SrtAckData {
-  let view = srt_ack::View::new(data);
-  return SrtAckData{
-    receiving_rate: view.receiving_rate().read(),
-    rtt: view.rtt().read(),
-    estimated_link_capacity: view.estimated_link_capacity().read()
+pub fn nak_count_missing(data: &[u8]) -> u32 {
+  let mut missing_count = 0;
+  let mut current_row = 4;
+
+  loop {
+    if current_row >= data.len()/4 {
+      break
+    }
+    if data[current_row*4] & 0b10000000 == 0 {
+      // single nak
+      missing_count += 1;
+      current_row += 1;
+    } else {
+      let from_seq = u32::from_be_bytes([data[current_row*4] & 0b01111111, data[current_row*4+1], data[current_row*4+2], data[current_row*4+3]]);
+      current_row += 1;
+      let to_seq = u32::from_be_bytes([data[current_row*4], data[current_row*4+1], data[current_row*4+2], data[current_row*4+3]]);
+      missing_count += to_seq - from_seq;
+      current_row += 1;
+    }
   }
+  missing_count
+}
+
+pub fn is_srt_handshake(data: &[u8]) -> bool {
+  if data.len() < 2 {
+    return false
+  }
+  u16::from_be_bytes([data[0], data[1]]) == SRT_TYPE_HANDSHAKE
+}
+
+pub fn is_srt_data(data: &[u8]) -> bool {
+  data[0] & 0b10000000 == 0
+}
+
+pub fn extract_srt_stream_id(data: &[u8]) -> Result<String, Error> {
+  if data.len() < 68 {
+    return Err(Error::msg("Handshake packet does not contain extensions"));
+  }
+  let mut current_extension_idx = 64;
+
+  loop {
+    let extension_type = u16::from_be_bytes([data[current_extension_idx], data[current_extension_idx+1]]);
+    let extension_length = usize::from(u16::from_be_bytes([data[current_extension_idx+2], data[current_extension_idx+3]]))*4;
+
+    if extension_type == SRT_EXTENSION_TYPE_SID {
+      if data.len() < current_extension_idx + 4 + extension_length {
+        return Err(Error::msg("invalid extension length"))
+      }
+      let mut utf_data = data[current_extension_idx+4..current_extension_idx+4+extension_length].to_owned();
+      reverse_blocks_of_four(&mut utf_data);
+
+      return Ok(String::from_utf8_lossy(&utf_data).trim_matches(char::from(0)).to_string())
+    } else if data.len() >= current_extension_idx + 4 + extension_length + 4 {
+      current_extension_idx = current_extension_idx + 4 + extension_length;
+    } else {
+      break;
+    }
+  }
+  Err(Error::msg("Handshake packet does not contain SID extension"))
+}
+
+fn reverse_blocks_of_four(vec: &mut Vec<u8>) {
+  let mut index = 0;
+
+  while index + 4 <= vec.len() {
+    vec[index..index + 4].reverse();
+    index += 4;
+  }
+}
+
+pub fn get_srt_ack_rtt(data: &[u8]) -> u32 {
+  u32::from_be_bytes([data[20], data[21], data[22], data[23]])
 }
 
 fn new_srt_handshake(version: u32, ext_field: u16, handshake_type: u32) -> [u8; 64] {

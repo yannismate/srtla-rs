@@ -1,9 +1,8 @@
-use std::mem;
 use std::cmp::Ordering;
+use std::mem;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, atomic, RwLock};
-use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use anyhow::{Error, Result};
@@ -11,9 +10,10 @@ use crate::net::{packets, srt};
 use crate::net::packets::{SRTLA_ID_LEN, SrtlaPacketType, SrtlaParserMode};
 use crate::net;
 use log::{info, warn};
-use rand::RngCore;
+use rand::{RngCore};
 use tokio::time;
 use tokio::time::Instant;
+use crate::http::stats_server::{StatsServer, StatsUpdate};
 use crate::net::srt::SrtConnection;
 
 const SRTLA_RECV_ACK_AMOUNT: usize = 10;
@@ -21,8 +21,9 @@ const SRTLA_RECV_ACK_AMOUNT: usize = 10;
 pub struct SrtlaReceiver {
   socket: Arc<UdpSocket>,
   connections: Arc<RwLock<HashMap<SocketAddr, [u8; SRTLA_ID_LEN]>>>,
-  groups: Arc<RwLock<HashMap<[u8; SRTLA_ID_LEN], SrtlaGroup>>>,
+  pub groups: Arc<RwLock<HashMap<[u8; SRTLA_ID_LEN], SrtlaGroup>>>,
   srt_connection: SrtConnection,
+  stats_server: Option<Arc<StatsServer>>
 }
 
 #[derive(Debug)]
@@ -30,9 +31,7 @@ pub struct SrtlaGroup {
   connections: Vec<SrtlaConnection>,
   last_address: SocketAddr,
   srt_socket: Option<Arc<UdpSocket>>,
-  bytes_received: AtomicU32,
-  rtt: AtomicU32,
-  estimated_link_capacity: AtomicU32
+  srt_stream_id: Option<String>
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +43,7 @@ pub struct SrtlaConnection {
 
 
 impl SrtlaReceiver {
-  pub async fn new(port: u16, srt_connection: SrtConnection) -> Result<SrtlaReceiver, Error<>> {
+  pub async fn new(port: u16, srt_connection: SrtConnection, stats_server: Option<Arc<StatsServer>>) -> Result<SrtlaReceiver, Error<>> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     let socket = Arc::new(UdpSocket::bind(addr).await?);
 
@@ -52,7 +51,8 @@ impl SrtlaReceiver {
       socket,
       connections: Arc::new(RwLock::new(HashMap::new())),
       groups: Arc::new(RwLock::new(HashMap::new())),
-      srt_connection
+      srt_connection,
+      stats_server
     })
   }
 
@@ -127,6 +127,7 @@ impl SrtlaReceiver {
     let connections = self.connections.clone();
     let groups = self.groups.clone();
     let srt_addr = self.srt_connection.remote_addr;
+    let stats_server = self.stats_server.clone();
 
     // spawn small task to handle packet
     tokio::spawn(async move {
@@ -160,9 +161,7 @@ impl SrtlaReceiver {
           connections: vec![new_connection],
           last_address: source,
           srt_socket: None,
-          bytes_received: AtomicU32::new(0),
-          rtt: AtomicU32::new(0),
-          estimated_link_capacity: AtomicU32::new(0)
+          srt_stream_id: None
         };
         groups.write().expect("group lock should not be poisoned").insert(generated_id, new_group);
         connections.write().expect("connection lock should not be poisoned").insert(source, generated_id);
@@ -244,15 +243,29 @@ impl SrtlaReceiver {
           return Ok(());
         };
 
-        let packet_view = srt::srt_data::View::new(&data);
-        let seq_num = packet_view.seq_num().read();
+        let stream_id = if srt::is_srt_handshake(data.as_slice()) {
+          srt::extract_srt_stream_id(&data).ok()
+        } else {
+          None
+        };
 
         let (srtla_ack_channel_send, mut srtla_ack_channel_recv) = tokio::sync::oneshot::channel();
 
         if let Some(group) = groups.write().expect("group lock should not be poisoned").get_mut(&srtla_id) {
+          if let Some(sid) = stream_id {
+            info!("Received SRT Handshake for stream with Stream ID {}", sid);
+            group.srt_stream_id = Some(sid)
+          }
+          if let Some(ss) = stats_server.clone() {
+            if srt::is_srt_data(&data) {
+              ss.push_stats(group.srt_stream_id.clone(), StatsUpdate::AddBytesReceived(data.len() - 16))
+            }
+          }
           group.last_address = source;
           if let Some(c) = group.connections.iter_mut().find(|c| c.address.eq(&source)) {
             c.last_received = timestamp;
+            let packet_view = srt::srt_data::View::new(&data);
+            let seq_num = packet_view.seq_num().read();
             if seq_num & (1 << 31) == 0 {
               c.received_srt_packets.push(seq_num);
               if c.received_srt_packets.len() == SRTLA_RECV_ACK_AMOUNT {
@@ -286,7 +299,7 @@ impl SrtlaReceiver {
             let groups = groups.clone();
 
             tokio::spawn(async move {
-              srt_connection_loop(srtla_sock, new_sock, connections, groups, srtla_id).await;
+              srt_connection_loop(srtla_sock, new_sock, connections, groups, srtla_id, stats_server).await;
             });
           }
           new_sock.send(data.as_slice()).await?;
@@ -307,10 +320,12 @@ async fn srt_connection_loop(
   srt_sock: Arc<UdpSocket>,
   connections: Arc<RwLock<HashMap<SocketAddr, [u8; SRTLA_ID_LEN]>>>,
   groups: Arc<RwLock<HashMap<[u8; SRTLA_ID_LEN], SrtlaGroup>>>,
-  group_id: [u8; SRTLA_ID_LEN]
+  group_id: [u8; SRTLA_ID_LEN],
+  stats_server: Option<Arc<StatsServer>>
 ) {
   let mut buf: [u8; net::MTU] = [0; net::MTU];
   loop {
+    let stats_server = stats_server.clone();
     let recv_res = time::timeout(Duration::from_secs(5), srt_sock.recv(&mut buf)).await;
     let Ok(Ok(num_bytes)) = recv_res else {
       break;
@@ -322,12 +337,18 @@ async fn srt_connection_loop(
 
     if let Some(group) = groups.read().expect("group lock should not be poisoned").get(&group_id) {
       if srt::is_srt_ack(data) {
-        let srt_ack_data = srt::get_srt_ack_data(data);
-        group.bytes_received.store(srt_ack_data.receiving_rate, atomic::Ordering::Release);
-        group.rtt.store(srt_ack_data.rtt, atomic::Ordering::Release);
-        group.estimated_link_capacity.store(srt_ack_data.estimated_link_capacity, atomic::Ordering::Release);
-        send_to = group.connections.iter().map(|c| c.address).collect()
+        send_to = group.connections.iter().map(|c| c.address).collect();
+        if let Some(ss) = stats_server {
+          let ack_rtt = srt::get_srt_ack_rtt(data);
+          ss.push_stats(group.srt_stream_id.clone(), StatsUpdate::UpdateRTT(ack_rtt))
+        }
       } else {
+        if let Some(ss) = stats_server {
+          if srt::is_srt_nak(data) {
+            let missing_num = srt::nak_count_missing(data);
+            ss.push_stats(group.srt_stream_id.clone(), StatsUpdate::AddDroppedPackets(missing_num))
+          }
+        }
         send_to = vec![group.last_address];
       }
     } else {
